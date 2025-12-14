@@ -1,0 +1,21 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# IDE
+.vscode/
+.idea/
+
+# Build artifacts
+*.elf
+*.hex
+*.bin
+
+# macOS
+.DS_Store
+
+# Python virtual environment
+venv/
+.venv/
+
