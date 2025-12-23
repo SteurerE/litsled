@@ -28,8 +28,100 @@
 #include <EEPROM.h>
 #include "I2Cdev.h"
 #include "MPU6050.h"           // Basic MPU6050 (no DMP)
-#include <MadgwickAHRS.h>      // Software sensor fusion
 #include <FastLED.h>
+
+// ============== Custom Madgwick Filter (with adjustable beta) ==============
+// Higher beta = faster convergence to accelerometer, more noise
+// Lower beta = smoother output, slower response to orientation changes
+#define MADGWICK_BETA 1.0f  // Default is 0.1, we use 1.0 for very fast response
+
+class FastMadgwick {
+public:
+    float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;  // Quaternion
+    float invSampleFreq = 0.01f;  // 1/sampleFreq for integration
+    
+    void begin(float freq) { invSampleFreq = 1.0f / freq; }
+    void setDeltaTime(float dt) { invSampleFreq = dt; }  // Use actual dt
+    
+    void updateIMU(float gx, float gy, float gz, float ax, float ay, float az) {
+        float recipNorm;
+        float s0, s1, s2, s3;
+        float qDot1, qDot2, qDot3, qDot4;
+        float _2q0, _2q1, _2q2, _2q3, _4q0, _4q1, _4q2, _8q1, _8q2, q0q0, q1q1, q2q2, q3q3;
+
+        // Convert gyro from degrees/s to radians/s
+        gx *= 0.0174533f;
+        gy *= 0.0174533f;
+        gz *= 0.0174533f;
+
+        // Rate of change of quaternion from gyroscope
+        qDot1 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
+        qDot2 = 0.5f * (q0 * gx + q2 * gz - q3 * gy);
+        qDot3 = 0.5f * (q0 * gy - q1 * gz + q3 * gx);
+        qDot4 = 0.5f * (q0 * gz + q1 * gy - q2 * gx);
+
+        // Compute feedback only if accelerometer measurement valid
+        if (!((ax == 0.0f) && (ay == 0.0f) && (az == 0.0f))) {
+            // Normalize accelerometer
+            recipNorm = 1.0f / sqrt(ax * ax + ay * ay + az * az);
+            ax *= recipNorm;
+            ay *= recipNorm;
+            az *= recipNorm;
+
+            // Auxiliary variables
+            _2q0 = 2.0f * q0; _2q1 = 2.0f * q1; _2q2 = 2.0f * q2; _2q3 = 2.0f * q3;
+            _4q0 = 4.0f * q0; _4q1 = 4.0f * q1; _4q2 = 4.0f * q2;
+            _8q1 = 8.0f * q1; _8q2 = 8.0f * q2;
+            q0q0 = q0 * q0; q1q1 = q1 * q1; q2q2 = q2 * q2; q3q3 = q3 * q3;
+
+            // Gradient descent corrective step
+            s0 = _4q0 * q2q2 + _2q2 * ax + _4q0 * q1q1 - _2q1 * ay;
+            s1 = _4q1 * q3q3 - _2q3 * ax + 4.0f * q0q0 * q1 - _2q0 * ay - _4q1 + _8q1 * q1q1 + _8q1 * q2q2 + _4q1 * az;
+            s2 = 4.0f * q0q0 * q2 + _2q0 * ax + _4q2 * q3q3 - _2q3 * ay - _4q2 + _8q2 * q1q1 + _8q2 * q2q2 + _4q2 * az;
+            s3 = 4.0f * q1q1 * q3 - _2q1 * ax + 4.0f * q2q2 * q3 - _2q2 * ay;
+            
+            recipNorm = 1.0f / sqrt(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
+            s0 *= recipNorm; s1 *= recipNorm; s2 *= recipNorm; s3 *= recipNorm;
+
+            // Apply feedback step
+            qDot1 -= MADGWICK_BETA * s0;
+            qDot2 -= MADGWICK_BETA * s1;
+            qDot3 -= MADGWICK_BETA * s2;
+            qDot4 -= MADGWICK_BETA * s3;
+        }
+
+        // Integrate rate of change using actual delta time
+        q0 += qDot1 * invSampleFreq;
+        q1 += qDot2 * invSampleFreq;
+        q2 += qDot3 * invSampleFreq;
+        q3 += qDot4 * invSampleFreq;
+
+        // Normalize quaternion
+        recipNorm = 1.0f / sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+        q0 *= recipNorm; q1 *= recipNorm; q2 *= recipNorm; q3 *= recipNorm;
+    }
+
+    float getRoll() {
+        return atan2(2.0f * (q0 * q1 + q2 * q3), 1.0f - 2.0f * (q1 * q1 + q2 * q2)) * 57.29578f;
+    }
+    
+    float getPitch() {
+        float sinp = 2.0f * (q0 * q2 - q3 * q1);
+        if (abs(sinp) >= 1) return copysign(90.0f, sinp);
+        return asin(sinp) * 57.29578f;
+    }
+    
+    float getYaw() {
+        return atan2(2.0f * (q0 * q3 + q1 * q2), 1.0f - 2.0f * (q2 * q2 + q3 * q3)) * 57.29578f;
+    }
+    
+    // Get gravity vector directly from quaternion (faster than via angles)
+    void getGravity(float* gx, float* gy, float* gz) {
+        *gx = 2.0f * (q1 * q3 - q0 * q2);
+        *gy = 2.0f * (q0 * q1 + q2 * q3);
+        *gz = q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3;
+    }
+};
 
 // ============== EEPROM Calibration Storage ==============
 #define EEPROM_CAL_ADDR 0
@@ -100,17 +192,22 @@ constexpr unsigned long BRAKE_DEBOUNCE_MS     = 50;   // Debounce time after rel
 // ============== Globals ==============
 CRGB leds[NUM_LEDS];
 MPU6050 mpu;
-Madgwick filter;        // Madgwick sensor fusion filter
+FastMadgwick filter;    // Custom Madgwick with beta=0.5 for fast response
 
 // Timing for sensor fusion
 unsigned long lastUpdate = 0;
-const float SAMPLE_RATE_HZ = 100.0f;  // Target sample rate
+const float SAMPLE_RATE_HZ = 500.0f;  // Target sample rate (faster = better tracking)
 
 // Gyro bias (software correction)
 float gyroBiasX = 0, gyroBiasY = 0, gyroBiasZ = 0;
 
 // Sensor ready flag
 bool sensorReady = false;
+
+// Update rate measurement
+unsigned long updateCount = 0;
+unsigned long lastRateCheck = 0;
+float actualUpdateRate = 0;
 
 // ============== Sensor Data (use these in your application) ==============
 struct IMUData {
@@ -213,8 +310,8 @@ void setup() {
     FastLED.clear();
     FastLED.show();
 
-    Serial.println(F("\nSystem ready. Streaming IMU data...\n"));
-    Serial.println(F("Pitch\tRoll\tRawX\tGravX\tLinX\tFiltered\tBrake"));
+    Serial.println(F("\nSystem ready. Send 'c' to recalibrate.\n"));
+    Serial.println(F("Pitch\tRoll\tLinX\tRate\tBrake"));
 }
 
 // ============== Main Loop ==============
@@ -273,24 +370,46 @@ bool initMPU6050() {
     Serial.print(F(", "));
     Serial.println(gyroBiasZ, 2);
     
-    // Warm up the filter with bias-corrected samples
-    Serial.println(F("Warming up Madgwick filter..."));
-    for (int i = 0; i < 100; i++) {
+    // Extended warmup - run until filter converges
+    // Run 500 iterations (5 sec equivalent) but faster (no delay)
+    Serial.print(F("Warming up filter"));
+    float lastPitch = 0, lastRoll = 0;
+    int stableCount = 0;
+    
+    for (int i = 0; i < 1000; i++) {  // Max 1000 iterations
         int16_t ax, ay, az, gx, gy, gz;
         mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
         
-        // Convert to proper units
         float ax_g = ax / 16384.0f;
         float ay_g = ay / 16384.0f;
         float az_g = az / 16384.0f;
-        
-        // Apply software bias correction
         float gx_dps = (gx / 131.0f) - gyroBiasX;
         float gy_dps = (gy / 131.0f) - gyroBiasY;
         float gz_dps = (gz / 131.0f) - gyroBiasZ;
         
         filter.updateIMU(gx_dps, gy_dps, gz_dps, ax_g, ay_g, az_g);
-        delay(10);
+        
+        // Check for convergence every 50 iterations
+        if (i % 50 == 49) {
+            Serial.print(F("."));
+            float pitch = filter.getPitch();
+            float roll = filter.getRoll();
+            
+            // Check if values are stable (changed less than 0.5 deg)
+            if (abs(pitch - lastPitch) < 0.5f && abs(roll - lastRoll) < 0.5f) {
+                stableCount++;
+                if (stableCount >= 3) {  // Stable for 3 checks = converged
+                    Serial.println(F(" OK!"));
+                    break;
+                }
+            } else {
+                stableCount = 0;
+            }
+            lastPitch = pitch;
+            lastRoll = roll;
+        }
+        
+        delay(2);  // Small delay for I2C stability
     }
     
     sensorReady = true;
@@ -302,13 +421,23 @@ bool initMPU6050() {
 void updateIMU() {
     if (!sensorReady) return;
 
-    // Calculate actual delta time for accurate filter update
+    // Run as fast as possible - no rate limiting
     unsigned long now = micros();
-    float dt = (now - lastUpdate) / 1000000.0f;
+    unsigned long elapsed = now - lastUpdate;
+    if (elapsed < 1000UL) return;  // Min 1ms between updates (max 1000Hz)
     lastUpdate = now;
     
-    // Clamp dt to reasonable range (avoid issues on first call or overflow)
-    if (dt <= 0 || dt > 0.1f) dt = 0.01f;
+    // Calculate actual delta time and pass to filter
+    float dt = elapsed / 1000000.0f;
+    filter.setDeltaTime(dt);
+    
+    // Count updates and measure actual rate every second
+    updateCount++;
+    if (now - lastRateCheck >= 1000000UL) {  // Every 1 second
+        actualUpdateRate = updateCount * 1000000.0f / (now - lastRateCheck);
+        updateCount = 0;
+        lastRateCheck = now;
+    }
 
     // Read raw sensor data
     int16_t ax, ay, az, gx, gy, gz;
@@ -337,8 +466,7 @@ void updateIMU() {
     float rawY = ay_g * G;
     float rawZ = az_g * G;
     
-    // Calculate gravity components from orientation
-    // (Using pitch angle to estimate gravity on X axis)
+    // Calculate gravity components from orientation angles
     float pitchRad = imuData.pitch * M_PI / 180.0f;
     float rollRad  = imuData.roll * M_PI / 180.0f;
     
@@ -608,22 +736,24 @@ void printIMUData() {
     static unsigned long lastPrint = 0;
     static BrakeState lastState = BrakeState::IDLE;
     
-    // Only print on state change OR every 200ms (5Hz) - reduces serial overhead
+    // Print immediately on brake state change
     bool stateChanged = (brakeDetector.state != lastState);
-    if (!stateChanged && (millis() - lastPrint < 200)) return;
+    
+    // Otherwise print every 500ms (2Hz) to minimize serial overhead
+    if (!stateChanged && (millis() - lastPrint < 500)) return;
     
     lastPrint = millis();
     lastState = brakeDetector.state;
 
-    // Compact output to reduce serial time
-    Serial.print(imuData.pitch, 0);
+    // Output with actual update rate
+    Serial.print(imuData.pitch, 1);
     Serial.print(F("\t"));
-    Serial.print(imuData.roll, 0);
+    Serial.print(imuData.roll, 1);
     Serial.print(F("\t"));
-    Serial.print(imuData.accelX, 1);      // Linear accel (main value)
+    Serial.print(imuData.accelX, 2);
     Serial.print(F("\t"));
-    Serial.print(imuData.accelForwardFiltered, 1);
-    Serial.print(F("\t"));
+    Serial.print((int)actualUpdateRate);
+    Serial.print(F("Hz\t"));
 
     // Brake state indicator
     switch (brakeDetector.state) {
