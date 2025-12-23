@@ -346,8 +346,9 @@ bool initMPU6050() {
     mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);   // ±250 deg/s
     mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);   // ±2g
     
-    // Set sample rate divider (1kHz / (1 + 9) = 100Hz)
-    mpu.setRate(9);
+    // Set sample rate divider (1kHz / (1 + 1) = 500Hz)
+    // Higher rate = less stale data when we read frequently
+    mpu.setRate(1);
     
     // Configure low-pass filter (reduces noise)
     mpu.setDLPFMode(MPU6050_DLPF_BW_20);
@@ -421,14 +422,15 @@ bool initMPU6050() {
 void updateIMU() {
     if (!sensorReady) return;
 
-    // Run as fast as possible - no rate limiting
+    // Rate limiting to match sensor's internal rate (500Hz)
     unsigned long now = micros();
     unsigned long elapsed = now - lastUpdate;
-    if (elapsed < 1000UL) return;  // Min 1ms between updates (max 1000Hz)
+    if (elapsed < 2000UL) return;  // 2ms = 500Hz
     lastUpdate = now;
     
-    // Calculate actual delta time and pass to filter
+    // Pass actual dt to filter
     float dt = elapsed / 1000000.0f;
+    if (dt > 0.1f) dt = 0.002f;  // Clamp on first call or overflow
     filter.setDeltaTime(dt);
     
     // Count updates and measure actual rate every second
