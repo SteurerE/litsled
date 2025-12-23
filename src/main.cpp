@@ -25,9 +25,32 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <EEPROM.h>
 #include "I2Cdev.h"
-#include "MPU6050_6Axis_MotionApps20.h"
+#include "MPU6050.h"           // Basic MPU6050 (no DMP)
+#include <MadgwickAHRS.h>      // Software sensor fusion
 #include <FastLED.h>
+
+// ============== EEPROM Calibration Storage ==============
+#define EEPROM_CAL_ADDR 0
+#define EEPROM_CAL_MAGIC 0xCA1B  // Magic number to verify valid data
+
+struct CalibrationData {
+    uint16_t magic;       // Magic number to verify data
+    float gyroBiasX;
+    float gyroBiasY;
+    float gyroBiasZ;
+    uint16_t checksum;    // Simple checksum
+};
+
+uint16_t calcChecksum(const CalibrationData& cal) {
+    uint16_t sum = 0;
+    const uint8_t* ptr = (const uint8_t*)&cal;
+    for (size_t i = 0; i < offsetof(CalibrationData, checksum); i++) {
+        sum += ptr[i];
+    }
+    return sum;
+}
 
 // ============== LED Configuration ==============
 #define LED_PIN       6
@@ -77,31 +100,33 @@ constexpr unsigned long BRAKE_DEBOUNCE_MS     = 50;   // Debounce time after rel
 // ============== Globals ==============
 CRGB leds[NUM_LEDS];
 MPU6050 mpu;
+Madgwick filter;        // Madgwick sensor fusion filter
 
-// MPU6050 DMP variables
-bool dmpReady = false;
-uint8_t mpuIntStatus;
-uint8_t devStatus;
-uint16_t packetSize;
-uint16_t fifoCount;
-uint8_t fifoBuffer[64];
+// Timing for sensor fusion
+unsigned long lastUpdate = 0;
+const float SAMPLE_RATE_HZ = 100.0f;  // Target sample rate
 
-// Orientation and motion data
-Quaternion q;           // Quaternion container
-VectorInt16 aa;         // Raw accelerometer readings
-VectorInt16 aaReal;     // Gravity-removed acceleration (body frame)
-VectorFloat gravity;    // Gravity vector
-float ypr[3];           // Yaw, Pitch, Roll in radians
+// Gyro bias (software correction)
+float gyroBiasX = 0, gyroBiasY = 0, gyroBiasZ = 0;
+
+// Sensor ready flag
+bool sensorReady = false;
 
 // ============== Sensor Data (use these in your application) ==============
 struct IMUData {
-    // Angles in degrees (from DMP sensor fusion)
+    // Angles in degrees (from Madgwick sensor fusion)
     float roll;
     float pitch;
     float yaw;
 
+    // Debug: raw acceleration (includes gravity)
+    float rawAccelX;
+    
+    // Debug: estimated gravity X component
+    float gravityX;
+
     // Body-frame linear acceleration in m/s² (gravity removed by DMP)
-    float accelX;  // Forward (along sled direction) - RAW
+    float accelX;  // Forward (along sled direction) - LINEAR (gravity removed)
     float accelY;  // Lateral (left/right)
     float accelZ;  // Vertical (up/down relative to sled)
 
@@ -137,15 +162,9 @@ struct BrakeDetector {
     unsigned long stateEntryTime = 0;
 } brakeDetector;
 
-// Interrupt detection
-volatile bool mpuInterrupt = false;
-void dmpDataReady() {
-    mpuInterrupt = true;
-}
-
 // ============== Function Declarations ==============
 bool initMPU6050();
-bool updateIMU();
+void updateIMU();
 void updateBrakeDetection(float rawAccelX);
 float applyMedianFilter(float newValue);
 float applyEMAFilter(float newValue);
@@ -157,6 +176,10 @@ void showSidePatternRight();
 void showIdlePattern();
 void fillSection(uint8_t start, uint8_t end, CRGB color);
 void printIMUData();
+bool loadCalibration();
+void saveCalibration();
+void performCalibration();
+void checkSerialCommands();
 
 // ============== Setup ==============
 void setup() {
@@ -191,27 +214,30 @@ void setup() {
     FastLED.show();
 
     Serial.println(F("\nSystem ready. Streaming IMU data...\n"));
-    Serial.println(F("Roll\tPitch\tAccX\tFiltered\tBrake"));
+    Serial.println(F("Pitch\tRoll\tRawX\tGravX\tLinX\tFiltered\tBrake"));
 }
 
 // ============== Main Loop ==============
 void loop() {
-    // Check if DMP data is available
-    if (updateIMU()) {
-        printIMUData();
-    }
+    // Check for serial commands (e.g., 'c' to recalibrate)
+    checkSerialCommands();
+    
+    // Update IMU (Madgwick sensor fusion)
+    updateIMU();
+    
+    // Print data at reduced rate
+    printIMUData();
 
     // Update LED display based on brake state
     updateLEDs();
 }
 
-// ============== MPU6050 DMP Initialization ==============
+// ============== MPU6050 + Madgwick Initialization ==============
 bool initMPU6050() {
     Serial.println(F("Initializing MPU6050..."));
     mpu.initialize();
 
     // Verify connection
-    pinMode(INTERRUPT_PIN, INPUT);
     Serial.print(F("Testing MPU6050 connection... "));
     if (!mpu.testConnection()) {
         Serial.println(F("FAILED"));
@@ -219,116 +245,118 @@ bool initMPU6050() {
     }
     Serial.println(F("OK"));
 
-    // Initialize DMP
-    Serial.println(F("Initializing DMP..."));
-    devStatus = mpu.dmpInitialize();
-
-    // Supply your own gyro offsets here (or use calibration)
-    // These are example values - run calibration for best results
-    mpu.setXGyroOffset(220);
-    mpu.setYGyroOffset(76);
-    mpu.setZGyroOffset(-85);
-    mpu.setZAccelOffset(1788);
-
-    if (devStatus == 0) {
-        // Calibration
-        Serial.println(F("Calibrating... Keep device still!"));
-        mpu.CalibrateAccel(6);
-        mpu.CalibrateGyro(6);
-        mpu.PrintActiveOffsets();
-
-        // Enable DMP
-        Serial.println(F("Enabling DMP..."));
-        mpu.setDMPEnabled(true);
-
-        // Enable interrupt
-        Serial.print(F("Enabling interrupt on pin "));
-        Serial.println(INTERRUPT_PIN);
-        attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), dmpDataReady, RISING);
-        mpuIntStatus = mpu.getIntStatus();
-
-        dmpReady = true;
-        packetSize = mpu.dmpGetFIFOPacketSize();
-
-        Serial.println(F("DMP ready!"));
-        return true;
-    } else {
-        // ERROR!
-        // 1 = initial memory load failed
-        // 2 = DMP configuration updates failed
-        Serial.print(F("DMP Initialization failed (code "));
-        Serial.print(devStatus);
-        Serial.println(F(")"));
-        return false;
+    // Configure sensor ranges
+    mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);   // ±250 deg/s
+    mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);   // ±2g
+    
+    // Set sample rate divider (1kHz / (1 + 9) = 100Hz)
+    mpu.setRate(9);
+    
+    // Configure low-pass filter (reduces noise)
+    mpu.setDLPFMode(MPU6050_DLPF_BW_20);
+    
+    // Initialize Madgwick filter
+    filter.begin(SAMPLE_RATE_HZ);
+    
+    // Try to load calibration from EEPROM
+    if (!loadCalibration()) {
+        // No valid calibration found - perform new calibration
+        Serial.println(F("No stored calibration found."));
+        performCalibration();
+        saveCalibration();
     }
+    
+    Serial.print(F("Using gyro bias (deg/s): "));
+    Serial.print(gyroBiasX, 2);
+    Serial.print(F(", "));
+    Serial.print(gyroBiasY, 2);
+    Serial.print(F(", "));
+    Serial.println(gyroBiasZ, 2);
+    
+    // Warm up the filter with bias-corrected samples
+    Serial.println(F("Warming up Madgwick filter..."));
+    for (int i = 0; i < 100; i++) {
+        int16_t ax, ay, az, gx, gy, gz;
+        mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+        
+        // Convert to proper units
+        float ax_g = ax / 16384.0f;
+        float ay_g = ay / 16384.0f;
+        float az_g = az / 16384.0f;
+        
+        // Apply software bias correction
+        float gx_dps = (gx / 131.0f) - gyroBiasX;
+        float gy_dps = (gy / 131.0f) - gyroBiasY;
+        float gz_dps = (gz / 131.0f) - gyroBiasZ;
+        
+        filter.updateIMU(gx_dps, gy_dps, gz_dps, ax_g, ay_g, az_g);
+        delay(10);
+    }
+    
+    sensorReady = true;
+    Serial.println(F("Madgwick filter ready!"));
+    return true;
 }
 
-// ============== IMU Update ==============
-bool updateIMU() {
-    if (!dmpReady) return false;
+// ============== IMU Update (Madgwick Filter) ==============
+void updateIMU() {
+    if (!sensorReady) return;
 
-    // Check for new data (interrupt or polling)
-    if (!mpuInterrupt && fifoCount < packetSize) {
-        fifoCount = mpu.getFIFOCount();
-        if (fifoCount < packetSize) return false;
-    }
+    // Calculate actual delta time for accurate filter update
+    unsigned long now = micros();
+    float dt = (now - lastUpdate) / 1000000.0f;
+    lastUpdate = now;
+    
+    // Clamp dt to reasonable range (avoid issues on first call or overflow)
+    if (dt <= 0 || dt > 0.1f) dt = 0.01f;
 
-    mpuInterrupt = false;
-    mpuIntStatus = mpu.getIntStatus();
-    fifoCount = mpu.getFIFOCount();
+    // Read raw sensor data
+    int16_t ax, ay, az, gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    
+    // Convert accelerometer to g (±2g range = 16384 LSB/g)
+    float ax_g = ax / 16384.0f;
+    float ay_g = ay / 16384.0f;
+    float az_g = az / 16384.0f;
+    
+    // Convert gyroscope to deg/s and apply software bias correction
+    float gx_dps = (gx / 131.0f) - gyroBiasX;
+    float gy_dps = (gy / 131.0f) - gyroBiasY;
+    float gz_dps = (gz / 131.0f) - gyroBiasZ;
+    
+    // Update Madgwick filter (sensor fusion)
+    filter.updateIMU(gx_dps, gy_dps, gz_dps, ax_g, ay_g, az_g);
+    
+    // Get orientation from filter
+    imuData.roll  = filter.getRoll();
+    imuData.pitch = filter.getPitch();
+    imuData.yaw   = filter.getYaw();
+    
+    // Convert accel to m/s²
+    float rawX = ax_g * G;
+    float rawY = ay_g * G;
+    float rawZ = az_g * G;
+    
+    // Calculate gravity components from orientation
+    // (Using pitch angle to estimate gravity on X axis)
+    float pitchRad = imuData.pitch * M_PI / 180.0f;
+    float rollRad  = imuData.roll * M_PI / 180.0f;
+    
+    float gravX = -sin(pitchRad) * G;
+    float gravY = sin(rollRad) * cos(pitchRad) * G;
+    float gravZ = cos(rollRad) * cos(pitchRad) * G;
+    
+    // Linear acceleration = raw - gravity
+    imuData.accelX = rawX - gravX;
+    imuData.accelY = rawY - gravY;
+    imuData.accelZ = rawZ - gravZ;
+    
+    // Debug values
+    imuData.rawAccelX = rawX;
+    imuData.gravityX = gravX;
 
-    // Check for overflow
-    if ((mpuIntStatus & 0x10) || fifoCount == 1024) {
-        mpu.resetFIFO();
-        Serial.println(F("FIFO overflow!"));
-        return false;
-    }
-
-    // Check for DMP data ready
-    if (mpuIntStatus & 0x02) {
-        // Wait for complete packet
-        while (fifoCount < packetSize) {
-            fifoCount = mpu.getFIFOCount();
-        }
-
-        // Read packet from FIFO
-        mpu.getFIFOBytes(fifoBuffer, packetSize);
-        fifoCount -= packetSize;
-
-        // Get quaternion
-        mpu.dmpGetQuaternion(&q, fifoBuffer);
-
-        // Get gravity vector
-        mpu.dmpGetGravity(&gravity, &q);
-
-        // Get Yaw/Pitch/Roll angles from DMP (onboard EKF)
-        mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
-
-        // Convert to degrees and store
-        imuData.yaw   = ypr[0] * 180.0f / M_PI;
-        imuData.pitch = ypr[1] * 180.0f / M_PI;
-        imuData.roll  = ypr[2] * 180.0f / M_PI;
-
-        // Get raw acceleration
-        mpu.dmpGetAccel(&aa, fifoBuffer);
-
-        // Get linear acceleration (gravity removed by DMP)
-        mpu.dmpGetLinearAccel(&aaReal, &aa, &gravity);
-
-        // Convert to m/s²
-        // DMP FIFO uses 8192 LSB per g (as per library source)
-        const float LSB_TO_MS2 = G / 8192.0f;
-        imuData.accelX = aaReal.x * LSB_TO_MS2;
-        imuData.accelY = aaReal.y * LSB_TO_MS2;
-        imuData.accelZ = aaReal.z * LSB_TO_MS2;
-
-        // Apply filtering and brake detection
-        updateBrakeDetection(imuData.accelX);
-
-        return true;
-    }
-
-    return false;
+    // Apply filtering and brake detection
+    updateBrakeDetection(imuData.accelX);
 }
 
 // ============== Median Filter ==============
@@ -578,17 +606,24 @@ void showSidePatternRight() {
 // ============== Debug Output ==============
 void printIMUData() {
     static unsigned long lastPrint = 0;
-    if (millis() - lastPrint < 50) return;  // 20 Hz print rate
+    static BrakeState lastState = BrakeState::IDLE;
+    
+    // Only print on state change OR every 200ms (5Hz) - reduces serial overhead
+    bool stateChanged = (brakeDetector.state != lastState);
+    if (!stateChanged && (millis() - lastPrint < 200)) return;
+    
     lastPrint = millis();
+    lastState = brakeDetector.state;
 
-    Serial.print(imuData.roll, 1);
+    // Compact output to reduce serial time
+    Serial.print(imuData.pitch, 0);
     Serial.print(F("\t"));
-    Serial.print(imuData.pitch, 1);
+    Serial.print(imuData.roll, 0);
     Serial.print(F("\t"));
-    Serial.print(imuData.accelX, 2);
+    Serial.print(imuData.accelX, 1);      // Linear accel (main value)
     Serial.print(F("\t"));
-    Serial.print(imuData.accelForwardFiltered, 2);
-    Serial.print(F("\t\t"));
+    Serial.print(imuData.accelForwardFiltered, 1);
+    Serial.print(F("\t"));
 
     // Brake state indicator
     switch (brakeDetector.state) {
@@ -596,5 +631,93 @@ void printIMUData() {
         case BrakeState::PENDING:   Serial.println(F("PENDING"));   break;
         case BrakeState::BRAKING:   Serial.println(F("BRAKE!"));    break;
         case BrakeState::RELEASING: Serial.println(F("RELEASING")); break;
+    }
+}
+
+// ============== EEPROM Calibration Functions ==============
+
+bool loadCalibration() {
+    CalibrationData cal;
+    EEPROM.get(EEPROM_CAL_ADDR, cal);
+    
+    // Check magic number
+    if (cal.magic != EEPROM_CAL_MAGIC) {
+        Serial.println(F("EEPROM: No valid magic number"));
+        return false;
+    }
+    
+    // Verify checksum
+    if (cal.checksum != calcChecksum(cal)) {
+        Serial.println(F("EEPROM: Checksum mismatch"));
+        return false;
+    }
+    
+    // Load calibration values
+    gyroBiasX = cal.gyroBiasX;
+    gyroBiasY = cal.gyroBiasY;
+    gyroBiasZ = cal.gyroBiasZ;
+    
+    Serial.println(F("Loaded calibration from EEPROM"));
+    return true;
+}
+
+void saveCalibration() {
+    CalibrationData cal;
+    cal.magic = EEPROM_CAL_MAGIC;
+    cal.gyroBiasX = gyroBiasX;
+    cal.gyroBiasY = gyroBiasY;
+    cal.gyroBiasZ = gyroBiasZ;
+    cal.checksum = calcChecksum(cal);
+    
+    EEPROM.put(EEPROM_CAL_ADDR, cal);
+    Serial.println(F("Calibration saved to EEPROM"));
+}
+
+void performCalibration() {
+    Serial.println(F("Calibrating gyro (keep still 2 sec)..."));
+    int32_t gx_sum = 0, gy_sum = 0, gz_sum = 0;
+    const int samples = 200;  // 2 seconds
+    
+    for (int i = 0; i < samples; i++) {
+        int16_t ax, ay, az, gx, gy, gz;
+        mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+        gx_sum += gx;
+        gy_sum += gy;
+        gz_sum += gz;
+        delay(10);
+    }
+    
+    // Store gyro bias in deg/s (131 LSB/(deg/s) at ±250°/s range)
+    gyroBiasX = (gx_sum / samples) / 131.0f;
+    gyroBiasY = (gy_sum / samples) / 131.0f;
+    gyroBiasZ = (gz_sum / samples) / 131.0f;
+    
+    Serial.println(F("Calibration complete!"));
+}
+
+void checkSerialCommands() {
+    if (Serial.available() > 0) {
+        char cmd = Serial.read();
+        if (cmd == 'c' || cmd == 'C') {
+            Serial.println(F("\n=== Recalibration requested ==="));
+            performCalibration();
+            saveCalibration();
+            
+            // Re-warm the filter
+            Serial.println(F("Warming up filter..."));
+            for (int i = 0; i < 50; i++) {
+                int16_t ax, ay, az, gx, gy, gz;
+                mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+                float ax_g = ax / 16384.0f;
+                float ay_g = ay / 16384.0f;
+                float az_g = az / 16384.0f;
+                float gx_dps = (gx / 131.0f) - gyroBiasX;
+                float gy_dps = (gy / 131.0f) - gyroBiasY;
+                float gz_dps = (gz / 131.0f) - gyroBiasZ;
+                filter.updateIMU(gx_dps, gy_dps, gz_dps, ax_g, ay_g, az_g);
+                delay(10);
+            }
+            Serial.println(F("Ready!\n"));
+        }
     }
 }
