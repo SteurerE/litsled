@@ -137,7 +137,7 @@ public:
 
 // ============== EEPROM Calibration Storage ==============
 #define EEPROM_CAL_ADDR 0
-#define EEPROM_CAL_MAGIC 0xCA1C  // Magic number (changed to invalidate old data)
+#define EEPROM_CAL_MAGIC 0xCA1C
 
 struct CalibrationData {
     uint16_t magic;       // Magic number to verify data
@@ -166,7 +166,7 @@ uint16_t calcChecksum(const CalibrationData& cal) {
 #define LED_PIN       6
 #define LED_TYPE      WS2812B
 #define COLOR_ORDER   GRB
-#define BRIGHTNESS    128
+#define BRIGHTNESS    255  // Full brightness (brake light needs max)
 
 // LED Strip: 2m WS2812B @ 33 LEDs/m = 66 LEDs total
 // Physical wiring order: [LEFT SIDE] → [BACK] → [RIGHT SIDE]
@@ -836,8 +836,8 @@ void showIdlePattern() {
     //   - Off completely
     //   - Subtle glow
 
-    // Placeholder: dim red tail light
-    fillSection(SECTION_BACK_START, SECTION_BACK_END, CRGB(30, 0, 0));
+    // Placeholder: dim red tail light (reduced since global brightness is now 255)
+    fillSection(SECTION_BACK_START, SECTION_BACK_END, CRGB(15, 0, 0));
 }
 
 // ============== Side Sections: Pitch-Controlled Rainbow ==============
@@ -874,13 +874,16 @@ void updateSideRainbow() {
     rainbowHueOffset += (int16_t)(speed * 10);  // *10 for sub-integer precision
 }
 
+// Side LED brightness (reduced so brake light can be full brightness)
+constexpr uint8_t SIDE_BRIGHTNESS = 100;  // ~50% of max (was 200 @ 50% global)
+
 // LEFT Side Section - 26 LEDs (80cm)
 void showSidePatternLeft() {
     // Fill left section with rainbow, direction: start → end
     uint8_t hue = rainbowHueOffset / 10;  // Convert back from fixed-point
 
     for (uint8_t i = SECTION_LEFT_START; i <= SECTION_LEFT_END; i++) {
-        leds[i] = CHSV(hue, 255, 200);  // Full saturation, slightly dimmed
+        leds[i] = CHSV(hue, 255, SIDE_BRIGHTNESS);
         hue += RAINBOW_HUE_DELTA;
     }
 }
@@ -891,7 +894,7 @@ void showSidePatternRight() {
     uint8_t hue = rainbowHueOffset / 10;  // Same starting hue as left
 
     for (uint8_t i = SECTION_RIGHT_END; i >= SECTION_RIGHT_START; i--) {
-        leds[i] = CHSV(hue, 255, 200);  // Full saturation, slightly dimmed
+        leds[i] = CHSV(hue, 255, SIDE_BRIGHTNESS);
         hue += RAINBOW_HUE_DELTA;
         if (i == 0) break;  // Prevent underflow
     }
