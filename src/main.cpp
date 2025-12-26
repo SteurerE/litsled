@@ -27,10 +27,21 @@
 #include <Wire.h>
 #include <EEPROM.h>
 #include "I2Cdev.h"
-#include "MPU6050.h"           // Basic MPU6050 (no DMP)
 #include <FastLED.h>
 
+// ============== SENSOR FUSION MODE ==============
+// Uncomment ONE of the following to select the sensor fusion method:
+#define USE_MADGWICK_FILTER    // Software Madgwick filter (recommended)
+// #define USE_DMP              // Hardware DMP (broken on this unit)
+
+#ifdef USE_DMP
+    #include "MPU6050_6Axis_MotionApps20.h"  // DMP version
+#else
+    #include "MPU6050.h"                      // Basic version (no DMP)
+#endif
+
 // ============== Custom Madgwick Filter (with adjustable beta) ==============
+#ifdef USE_MADGWICK_FILTER
 // Higher beta = faster convergence to accelerometer, more noise
 // Lower beta = smoother output, slower response to orientation changes
 #define MADGWICK_BETA 1.0f  // Default is 0.1, we use 1.0 for very fast response
@@ -122,18 +133,25 @@ public:
         *gz = q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3;
     }
 };
+#endif // USE_MADGWICK_FILTER
 
 // ============== EEPROM Calibration Storage ==============
 #define EEPROM_CAL_ADDR 0
-#define EEPROM_CAL_MAGIC 0xCA1B  // Magic number to verify valid data
+#define EEPROM_CAL_MAGIC 0xCA1C  // Magic number (changed to invalidate old data)
 
 struct CalibrationData {
     uint16_t magic;       // Magic number to verify data
     float gyroBiasX;
     float gyroBiasY;
     float gyroBiasZ;
+    int16_t accelOffsetX; // Accelerometer offsets
+    int16_t accelOffsetY;
+    int16_t accelOffsetZ;
     uint16_t checksum;    // Simple checksum
 };
+
+// Global accel offsets (used by DMP)
+int16_t accelOffsetX = 0, accelOffsetY = 0, accelOffsetZ = 0;
 
 uint16_t calcChecksum(const CalibrationData& cal) {
     uint16_t sum = 0;
@@ -192,13 +210,29 @@ constexpr unsigned long BRAKE_DEBOUNCE_MS     = 50;   // Debounce time after rel
 // ============== Globals ==============
 CRGB leds[NUM_LEDS];
 MPU6050 mpu;
-FastMadgwick filter;    // Custom Madgwick with beta=0.5 for fast response
+
+#ifdef USE_MADGWICK_FILTER
+FastMadgwick filter;    // Custom Madgwick with adjustable beta
+#endif
+
+#ifdef USE_DMP
+// DMP variables
+bool dmpReady = false;
+uint8_t devStatus;
+uint16_t packetSize;
+uint8_t fifoBuffer[64];
+Quaternion q;
+VectorFloat gravity;
+VectorInt16 aa;
+VectorInt16 aaReal;
+float ypr[3];
+#endif
 
 // Timing for sensor fusion
 unsigned long lastUpdate = 0;
-const float SAMPLE_RATE_HZ = 500.0f;  // Target sample rate (faster = better tracking)
+const float SAMPLE_RATE_HZ = 500.0f;  // Target sample rate
 
-// Gyro bias (software correction)
+// Gyro bias (software correction - used by both modes)
 float gyroBiasX = 0, gyroBiasY = 0, gyroBiasZ = 0;
 
 // Sensor ready flag
@@ -329,7 +363,7 @@ void loop() {
     updateLEDs();
 }
 
-// ============== MPU6050 + Madgwick Initialization ==============
+// ============== MPU6050 Initialization ==============
 bool initMPU6050() {
     Serial.println(F("Initializing MPU6050..."));
     mpu.initialize();
@@ -353,8 +387,10 @@ bool initMPU6050() {
     // Configure low-pass filter (reduces noise)
     mpu.setDLPFMode(MPU6050_DLPF_BW_20);
     
+#ifdef USE_MADGWICK_FILTER
     // Initialize Madgwick filter
     filter.begin(SAMPLE_RATE_HZ);
+#endif
     
     // Try to load calibration from EEPROM
     if (!loadCalibration()) {
@@ -371,13 +407,13 @@ bool initMPU6050() {
     Serial.print(F(", "));
     Serial.println(gyroBiasZ, 2);
     
+#ifdef USE_MADGWICK_FILTER
     // Extended warmup - run until filter converges
-    // Run 500 iterations (5 sec equivalent) but faster (no delay)
-    Serial.print(F("Warming up filter"));
+    Serial.print(F("Warming up Madgwick filter"));
     float lastPitch = 0, lastRoll = 0;
     int stableCount = 0;
     
-    for (int i = 0; i < 1000; i++) {  // Max 1000 iterations
+    for (int i = 0; i < 1000; i++) {
         int16_t ax, ay, az, gx, gy, gz;
         mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
         
@@ -390,16 +426,14 @@ bool initMPU6050() {
         
         filter.updateIMU(gx_dps, gy_dps, gz_dps, ax_g, ay_g, az_g);
         
-        // Check for convergence every 50 iterations
         if (i % 50 == 49) {
             Serial.print(F("."));
             float pitch = filter.getPitch();
             float roll = filter.getRoll();
             
-            // Check if values are stable (changed less than 0.5 deg)
             if (abs(pitch - lastPitch) < 0.5f && abs(roll - lastRoll) < 0.5f) {
                 stableCount++;
-                if (stableCount >= 3) {  // Stable for 3 checks = converged
+                if (stableCount >= 3) {
                     Serial.println(F(" OK!"));
                     break;
                 }
@@ -409,53 +443,133 @@ bool initMPU6050() {
             lastPitch = pitch;
             lastRoll = roll;
         }
-        
-        delay(2);  // Small delay for I2C stability
+        delay(2);
     }
-    
     sensorReady = true;
     Serial.println(F("Madgwick filter ready!"));
+#endif
+
+#ifdef USE_DMP
+    // Initialize DMP
+    Serial.println(F("Initializing DMP..."));
+    
+    devStatus = mpu.dmpInitialize();
+    
+    if (devStatus == 0) {
+        // Fast simple calibration (1 second, fixed samples)
+        Serial.println(F("Calibrating (keep flat & still 1 sec)..."));
+        int32_t gx_sum = 0, gy_sum = 0, gz_sum = 0;
+        int32_t ax_sum = 0, ay_sum = 0, az_sum = 0;
+        const int samples = 100;
+        
+        for (int i = 0; i < samples; i++) {
+            int16_t ax, ay, az, gx, gy, gz;
+            mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+            gx_sum += gx;
+            gy_sum += gy;
+            gz_sum += gz;
+            ax_sum += ax;
+            ay_sum += ay;
+            az_sum += az;
+            delay(10);
+        }
+        
+        // Set gyro offsets (offset register = -mean / 4)
+        mpu.setXGyroOffset(-gx_sum / samples / 4);
+        mpu.setYGyroOffset(-gy_sum / samples / 4);
+        mpu.setZGyroOffset(-gz_sum / samples / 4);
+        
+        // Set accel offsets (offset register scale is /8, Z expects +1g = 16384)
+        mpu.setXAccelOffset(-ax_sum / samples / 8);
+        mpu.setYAccelOffset(-ay_sum / samples / 8);
+        mpu.setZAccelOffset((16384 - az_sum / samples) / 8);
+        
+        Serial.print(F("Gyro offsets: "));
+        Serial.print(mpu.getXGyroOffset());
+        Serial.print(F(", "));
+        Serial.print(mpu.getYGyroOffset());
+        Serial.print(F(", "));
+        Serial.println(mpu.getZGyroOffset());
+        
+        Serial.print(F("Accel offsets: "));
+        Serial.print(mpu.getXAccelOffset());
+        Serial.print(F(", "));
+        Serial.print(mpu.getYAccelOffset());
+        Serial.print(F(", "));
+        Serial.println(mpu.getZAccelOffset());
+        
+        mpu.setDMPEnabled(true);
+        mpu.resetFIFO();
+        packetSize = mpu.dmpGetFIFOPacketSize();
+        
+        // Extended warmup - let DMP filter converge (3 seconds)
+        Serial.println(F("DMP warmup (keep still 3 sec)..."));
+        unsigned long warmupStart = millis();
+        int packetCount = 0;
+        while (millis() - warmupStart < 3000) {
+            uint16_t fifoCount = mpu.getFIFOCount();
+            if (fifoCount >= packetSize) {
+                mpu.getFIFOBytes(fifoBuffer, packetSize);
+                packetCount++;
+            }
+        }
+        Serial.print(F("Warmup packets: "));
+        Serial.println(packetCount);
+        mpu.resetFIFO();  // Clear any stale data
+        
+        dmpReady = true;
+        sensorReady = true;
+        Serial.println(F("DMP ready!"));
+    } else {
+        Serial.print(F("DMP init failed: "));
+        Serial.println(devStatus);
+        return false;
+    }
+#endif
+
     return true;
 }
 
-// ============== IMU Update (Madgwick Filter) ==============
+// ============== IMU Update ==============
 void updateIMU() {
     if (!sensorReady) return;
 
-    // Rate limiting to match sensor's internal rate (500Hz)
     unsigned long now = micros();
     unsigned long elapsed = now - lastUpdate;
-    if (elapsed < 2000UL) return;  // 2ms = 500Hz
+
+#ifdef USE_MADGWICK_FILTER
+    // Rate limiting to match sensor's internal rate (500Hz)
+    if (elapsed < 2000UL) return;
     lastUpdate = now;
     
-    // Pass actual dt to filter
-    float dt = elapsed / 1000000.0f;
-    if (dt > 0.1f) dt = 0.002f;  // Clamp on first call or overflow
-    filter.setDeltaTime(dt);
-    
-    // Count updates and measure actual rate every second
+    // Count successful updates
     updateCount++;
-    if (now - lastRateCheck >= 1000000UL) {  // Every 1 second
+    if (now - lastRateCheck >= 1000000UL) {
         actualUpdateRate = updateCount * 1000000.0f / (now - lastRateCheck);
         updateCount = 0;
         lastRateCheck = now;
     }
+    
+    // Pass actual dt to filter
+    float dt = elapsed / 1000000.0f;
+    if (dt > 0.1f) dt = 0.002f;
+    filter.setDeltaTime(dt);
 
     // Read raw sensor data
     int16_t ax, ay, az, gx, gy, gz;
     mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
     
-    // Convert accelerometer to g (±2g range = 16384 LSB/g)
+    // Convert accelerometer to g
     float ax_g = ax / 16384.0f;
     float ay_g = ay / 16384.0f;
     float az_g = az / 16384.0f;
     
-    // Convert gyroscope to deg/s and apply software bias correction
+    // Convert gyroscope to deg/s with bias correction
     float gx_dps = (gx / 131.0f) - gyroBiasX;
     float gy_dps = (gy / 131.0f) - gyroBiasY;
     float gz_dps = (gz / 131.0f) - gyroBiasZ;
     
-    // Update Madgwick filter (sensor fusion)
+    // Update Madgwick filter
     filter.updateIMU(gx_dps, gy_dps, gz_dps, ax_g, ay_g, az_g);
     
     // Get orientation from filter
@@ -463,12 +577,7 @@ void updateIMU() {
     imuData.pitch = filter.getPitch();
     imuData.yaw   = filter.getYaw();
     
-    // Convert accel to m/s²
-    float rawX = ax_g * G;
-    float rawY = ay_g * G;
-    float rawZ = az_g * G;
-    
-    // Calculate gravity components from orientation angles
+    // Calculate gravity from orientation
     float pitchRad = imuData.pitch * M_PI / 180.0f;
     float rollRad  = imuData.roll * M_PI / 180.0f;
     
@@ -477,13 +586,67 @@ void updateIMU() {
     float gravZ = cos(rollRad) * cos(pitchRad) * G;
     
     // Linear acceleration = raw - gravity
+    float rawX = ax_g * G;
+    float rawY = ay_g * G;
+    float rawZ = az_g * G;
+    
     imuData.accelX = rawX - gravX;
     imuData.accelY = rawY - gravY;
     imuData.accelZ = rawZ - gravZ;
-    
-    // Debug values
     imuData.rawAccelX = rawX;
     imuData.gravityX = gravX;
+#endif
+
+#ifdef USE_DMP
+    if (!dmpReady) return;
+    
+    // Check FIFO
+    uint16_t fifoCount = mpu.getFIFOCount();
+    if (fifoCount < packetSize) return;
+    
+    lastUpdate = now;
+    
+    // Count successful updates
+    updateCount++;
+    if (now - lastRateCheck >= 1000000UL) {
+        actualUpdateRate = updateCount * 1000000.0f / (now - lastRateCheck);
+        updateCount = 0;
+        lastRateCheck = now;
+    }
+    
+    // Handle overflow
+    if (fifoCount >= 1024) {
+        mpu.resetFIFO();
+        return;
+    }
+    
+    // Read only the latest packet
+    while (fifoCount >= packetSize * 2) {
+        mpu.getFIFOBytes(fifoBuffer, packetSize);
+        fifoCount -= packetSize;
+    }
+    mpu.getFIFOBytes(fifoBuffer, packetSize);
+    
+    // Get quaternion and compute orientation
+    mpu.dmpGetQuaternion(&q, fifoBuffer);
+    mpu.dmpGetGravity(&gravity, &q);
+    mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+    
+    imuData.yaw   = ypr[0] * 180.0f / M_PI;
+    imuData.pitch = ypr[1] * 180.0f / M_PI;
+    imuData.roll  = ypr[2] * 180.0f / M_PI;
+    
+    // Get linear acceleration (gravity removed by DMP)
+    mpu.dmpGetAccel(&aa, fifoBuffer);
+    mpu.dmpGetLinearAccel(&aaReal, &aa, &gravity);
+    
+    const float LSB_TO_MS2 = G / 8192.0f;
+    imuData.accelX = aaReal.x * LSB_TO_MS2;
+    imuData.accelY = aaReal.y * LSB_TO_MS2;
+    imuData.accelZ = aaReal.z * LSB_TO_MS2;
+    imuData.rawAccelX = aa.x * LSB_TO_MS2;
+    imuData.gravityX = gravity.x * G;
+#endif
 
     // Apply filtering and brake detection
     updateBrakeDetection(imuData.accelX);
@@ -788,6 +951,9 @@ bool loadCalibration() {
     gyroBiasX = cal.gyroBiasX;
     gyroBiasY = cal.gyroBiasY;
     gyroBiasZ = cal.gyroBiasZ;
+    accelOffsetX = cal.accelOffsetX;
+    accelOffsetY = cal.accelOffsetY;
+    accelOffsetZ = cal.accelOffsetZ;
     
     Serial.println(F("Loaded calibration from EEPROM"));
     return true;
@@ -799,6 +965,9 @@ void saveCalibration() {
     cal.gyroBiasX = gyroBiasX;
     cal.gyroBiasY = gyroBiasY;
     cal.gyroBiasZ = gyroBiasZ;
+    cal.accelOffsetX = accelOffsetX;
+    cal.accelOffsetY = accelOffsetY;
+    cal.accelOffsetZ = accelOffsetZ;
     cal.checksum = calcChecksum(cal);
     
     EEPROM.put(EEPROM_CAL_ADDR, cal);
@@ -806,8 +975,9 @@ void saveCalibration() {
 }
 
 void performCalibration() {
-    Serial.println(F("Calibrating gyro (keep still 2 sec)..."));
+    Serial.println(F("Calibrating (keep FLAT & STILL 2 sec)..."));
     int32_t gx_sum = 0, gy_sum = 0, gz_sum = 0;
+    int32_t ax_sum = 0, ay_sum = 0, az_sum = 0;
     const int samples = 200;  // 2 seconds
     
     for (int i = 0; i < samples; i++) {
@@ -816,6 +986,9 @@ void performCalibration() {
         gx_sum += gx;
         gy_sum += gy;
         gz_sum += gz;
+        ax_sum += ax;
+        ay_sum += ay;
+        az_sum += az;
         delay(10);
     }
     
@@ -823,6 +996,19 @@ void performCalibration() {
     gyroBiasX = (gx_sum / samples) / 131.0f;
     gyroBiasY = (gy_sum / samples) / 131.0f;
     gyroBiasZ = (gz_sum / samples) / 131.0f;
+    
+    // Calculate accel offsets (device must be flat, Z = +1g = 16384 at ±2g range)
+    // Offset register scaling is /8
+    accelOffsetX = -(ax_sum / samples) / 8;
+    accelOffsetY = -(ay_sum / samples) / 8;
+    accelOffsetZ = (16384 - (az_sum / samples)) / 8;
+    
+    Serial.print(F("Accel offsets: "));
+    Serial.print(accelOffsetX);
+    Serial.print(F(", "));
+    Serial.print(accelOffsetY);
+    Serial.print(F(", "));
+    Serial.println(accelOffsetZ);
     
     Serial.println(F("Calibration complete!"));
 }
@@ -835,7 +1021,8 @@ void checkSerialCommands() {
             performCalibration();
             saveCalibration();
             
-            // Re-warm the filter
+#ifdef USE_MADGWICK_FILTER
+            // Re-warm the Madgwick filter
             Serial.println(F("Warming up filter..."));
             for (int i = 0; i < 50; i++) {
                 int16_t ax, ay, az, gx, gy, gz;
@@ -849,6 +1036,28 @@ void checkSerialCommands() {
                 filter.updateIMU(gx_dps, gy_dps, gz_dps, ax_g, ay_g, az_g);
                 delay(10);
             }
+#endif
+
+#ifdef USE_DMP
+            // Fast simple recalibration for DMP
+            Serial.println(F("Calibrating (keep flat & still 1 sec)..."));
+            int32_t gx_sum = 0, gy_sum = 0, gz_sum = 0;
+            int32_t ax_sum = 0, ay_sum = 0, az_sum = 0;
+            for (int i = 0; i < 100; i++) {
+                int16_t ax, ay, az, gx, gy, gz;
+                mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+                gx_sum += gx; gy_sum += gy; gz_sum += gz;
+                ax_sum += ax; ay_sum += ay; az_sum += az;
+                delay(10);
+            }
+            mpu.setXGyroOffset(-gx_sum / 100 / 4);
+            mpu.setYGyroOffset(-gy_sum / 100 / 4);
+            mpu.setZGyroOffset(-gz_sum / 100 / 4);
+            mpu.setXAccelOffset(-ax_sum / 100 / 8);
+            mpu.setYAccelOffset(-ay_sum / 100 / 8);
+            mpu.setZAccelOffset((16384 - az_sum / 100) / 8);
+            mpu.resetFIFO();
+#endif
             Serial.println(F("Ready!\n"));
         }
     }
