@@ -31,13 +31,13 @@
 
 // ============== SENSOR FUSION MODE ==============
 // Uncomment ONE of the following to select the sensor fusion method:
-#define USE_MADGWICK_FILTER    // Software Madgwick filter (recommended)
-// #define USE_DMP              // Hardware DMP (broken on this unit)
+#define USE_MADGWICK_FILTER     // Software Madgwick filter
+// #define USE_DMP              // Hardware DMP
 
 #ifdef USE_DMP
     #include "MPU6050_6Axis_MotionApps20.h"  // DMP version
 #else
-    #include "MPU6050.h"                      // Basic version (no DMP)
+    #include "MPU6050.h"                     // Basic version (no DMP)
 #endif
 
 // ============== Custom Madgwick Filter (with adjustable beta) ==============
