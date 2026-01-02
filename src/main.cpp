@@ -168,27 +168,23 @@ uint16_t calcChecksum(const CalibrationData& cal) {
 #define COLOR_ORDER   GRB
 #define BRIGHTNESS    255  // Full brightness (brake light needs max)
 
-// LED Strip: 2m WS2812B @ 33 LEDs/m = 66 LEDs total
-// Physical wiring order: [LEFT SIDE] → [BACK] → [RIGHT SIDE]
-// Adjust the order below to match your actual wiring!
+// LED Strip: 120 LEDs/m, 3cm cut sections (3 LEDs per section)
+// 2 segments × 9 sections × 3 LEDs = 54 LEDs total
+// Physical wiring order: [BRAKE LIGHT] → [RAINBOW]
 
-constexpr uint8_t NUM_LEDS = 66;
+constexpr uint8_t NUM_LEDS = 54;
 
 // Section definitions (indices are inclusive)
-// Wiring assumption: Left(0-25) → Back(26-38) → Right(39-65)
-// Change these if your wiring order is different!
+// Section 1: Brake light (9 sections × 3 LEDs = 27 LEDs)
+// Section 2: Rainbow (9 sections × 3 LEDs = 27 LEDs)
 
-constexpr uint8_t SECTION_LEFT_START  = 0;
-constexpr uint8_t SECTION_LEFT_END    = 25;   // 26 LEDs (80cm)
-constexpr uint8_t SECTION_LEFT_COUNT  = SECTION_LEFT_END - SECTION_LEFT_START + 1;
+constexpr uint8_t SECTION_BRAKE_START  = 0;
+constexpr uint8_t SECTION_BRAKE_END    = 26;   // 27 LEDs - BRAKE LIGHT
+constexpr uint8_t SECTION_BRAKE_COUNT  = SECTION_BRAKE_END - SECTION_BRAKE_START + 1;
 
-constexpr uint8_t SECTION_BACK_START  = 26;
-constexpr uint8_t SECTION_BACK_END    = 38;   // 13 LEDs (40cm) - BRAKE LIGHT
-constexpr uint8_t SECTION_BACK_COUNT  = SECTION_BACK_END - SECTION_BACK_START + 1;
-
-constexpr uint8_t SECTION_RIGHT_START = 39;
-constexpr uint8_t SECTION_RIGHT_END   = 65;   // 27 LEDs (80cm)
-constexpr uint8_t SECTION_RIGHT_COUNT = SECTION_RIGHT_END - SECTION_RIGHT_START + 1;
+constexpr uint8_t SECTION_RAINBOW_START = 27;
+constexpr uint8_t SECTION_RAINBOW_END   = 53;  // 27 LEDs - RAINBOW
+constexpr uint8_t SECTION_RAINBOW_COUNT = SECTION_RAINBOW_END - SECTION_RAINBOW_START + 1;
 
 // ============== MPU6050 Configuration ==============
 #define INTERRUPT_PIN 2  // D2 for interrupt (optional)
@@ -302,8 +298,7 @@ float applyEMAFilter(float newValue);
 void updateLEDs();
 void updateSideRainbow();
 void showBrakeLight();
-void showSidePatternLeft();
-void showSidePatternRight();
+void showRainbowPattern();
 void showIdlePattern();
 void fillSection(uint8_t start, uint8_t end, CRGB color);
 void printIMUData();
@@ -785,11 +780,10 @@ void updateLEDs() {
     // Update rainbow animation (pitch controls speed)
     updateSideRainbow();
 
-    // Always update side sections (independent of brake state)
-    showSidePatternLeft();
-    showSidePatternRight();
+    // Update rainbow section
+    showRainbowPattern();
 
-    // Update back section based on brake state
+    // Update brake section based on brake state
     switch (brakeDetector.state) {
         case BrakeState::BRAKING:
         case BrakeState::RELEASING:  // Keep brake light on during release debounce
@@ -806,42 +800,18 @@ void updateLEDs() {
     FastLED.show();
 }
 
-// ============== BACK Section (Brake Light) ==============
-// Mounted on rear - 13 LEDs (40cm)
+// ============== Brake Light Section (9 LEDs) ==============
 void showBrakeLight() {
-    // ========================================
-    // TODO: Customize brake light effect!
-    // ========================================
-    //
-    // Available data:
-    //   imuData.accelForwardFiltered  - Brake intensity (more negative = harder)
-    //   SECTION_BACK_START/END        - LED indices for back section
-    //
-    // Ideas:
-    //   - Solid red
-    //   - Intensity based on brake force
-    //   - Flashing for hard braking (accel < -3 m/s²)
-
-    // Placeholder: solid bright red
-    fillSection(SECTION_BACK_START, SECTION_BACK_END, CRGB::Red);
+    // Solid bright red when braking
+    fillSection(SECTION_BRAKE_START, SECTION_BRAKE_END, CRGB::Red);
 }
 
-// Back section when NOT braking
+// Brake section when NOT braking - dim tail light
 void showIdlePattern() {
-    // ========================================
-    // TODO: Customize idle back pattern!
-    // ========================================
-    //
-    // Ideas:
-    //   - Dim red tail light
-    //   - Off completely
-    //   - Subtle glow
-
-    // Placeholder: dim red tail light (reduced since global brightness is now 255)
-    fillSection(SECTION_BACK_START, SECTION_BACK_END, CRGB(15, 0, 0));
+    fillSection(SECTION_BRAKE_START, SECTION_BRAKE_END, CRGB(15, 0, 0));
 }
 
-// ============== Side Sections: Pitch-Controlled Rainbow ==============
+// ============== Rainbow Section: Pitch-Controlled (9 LEDs) ==============
 //
 // Rainbow animation speed is controlled by pitch angle:
 //   - Flat (0°):     Slow/static rainbow
@@ -855,49 +825,26 @@ static uint16_t rainbowHueOffset = 0;
 constexpr float RAINBOW_MIN_SPEED = 1.0f;    // Minimum hue change per update (when flat)
 constexpr float RAINBOW_MAX_SPEED = 10.0f;   // Maximum hue change per update (steep pitch)
 constexpr float RAINBOW_PITCH_SCALE = 0.30f; // How much pitch affects speed (per degree)
-                                              // At 30° pitch: 1.0 + 30*0.3 = 10.0 (max speed)
-constexpr uint8_t RAINBOW_HUE_DELTA = 4;     // Hue difference between adjacent LEDs
+constexpr uint8_t RAINBOW_HUE_DELTA = 9;     // Hue difference between adjacent LEDs (256/27 ≈ 9 for full rainbow)
 
-// Helper: Update rainbow based on pitch and apply to a section
+// Helper: Update rainbow based on pitch
 void updateSideRainbow() {
-    // Calculate speed based on pitch angle
-    // Positive pitch = tilted forward (downhill) = faster animation
-    // Negative pitch = tilted backward (uphill) = slower/reverse
     float pitch = imuData.pitch;
-
-    // Speed scales with pitch: faster when going downhill
     float speed = RAINBOW_MIN_SPEED + (pitch * RAINBOW_PITCH_SCALE);
-
-    // Clamp speed to reasonable bounds (allow negative for reverse)
     speed = constrain(speed, -RAINBOW_MAX_SPEED, RAINBOW_MAX_SPEED);
-
-    // Update the hue offset (wraps automatically due to uint16_t)
-    rainbowHueOffset += (int16_t)(speed * 10);  // *10 for sub-integer precision
+    rainbowHueOffset += (int16_t)(speed * 10);
 }
 
-// Side LED brightness (reduced so brake light can be full brightness)
-constexpr uint8_t SIDE_BRIGHTNESS = 100;  // ~50% of max (was 200 @ 50% global)
+// Rainbow section brightness
+constexpr uint8_t RAINBOW_BRIGHTNESS = 100;
 
-// LEFT Side Section - 26 LEDs (80cm)
-void showSidePatternLeft() {
-    // Fill left section with rainbow, direction: start → end
-    uint8_t hue = rainbowHueOffset / 10;  // Convert back from fixed-point
+// Rainbow Section - 9 LEDs
+void showRainbowPattern() {
+    uint8_t hue = rainbowHueOffset / 10;
 
-    for (uint8_t i = SECTION_LEFT_START; i <= SECTION_LEFT_END; i++) {
-        leds[i] = CHSV(hue, 255, SIDE_BRIGHTNESS);
+    for (uint8_t i = SECTION_RAINBOW_START; i <= SECTION_RAINBOW_END; i++) {
+        leds[i] = CHSV(hue, 255, RAINBOW_BRIGHTNESS);
         hue += RAINBOW_HUE_DELTA;
-    }
-}
-
-// RIGHT Side Section - 27 LEDs (80cm)
-void showSidePatternRight() {
-    // Fill right section with rainbow, direction: end → start (mirrors left)
-    uint8_t hue = rainbowHueOffset / 10;  // Same starting hue as left
-
-    for (uint8_t i = SECTION_RIGHT_END; i >= SECTION_RIGHT_START; i--) {
-        leds[i] = CHSV(hue, 255, SIDE_BRIGHTNESS);
-        hue += RAINBOW_HUE_DELTA;
-        if (i == 0) break;  // Prevent underflow
     }
 }
 
