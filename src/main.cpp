@@ -314,9 +314,10 @@ void checkSerialCommands();
 
 // ============== Setup ==============
 void setup() {
-    // Initialize serial for debugging
+    // Initialize serial for debugging (non-blocking - works with or without serial monitor)
     Serial.begin(115200);
-    while (!Serial);  // Wait for serial on Leonardo/Micro
+    // Note: No blocking wait - firmware runs immediately, serial available when connected
+    delay(100);  // Brief delay for serial to initialize
     Serial.println(F("Project Rodel Racelight - IMU Data Logger"));
     Serial.println(F("=========================================="));
 
