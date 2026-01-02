@@ -168,22 +168,22 @@ uint16_t calcChecksum(const CalibrationData& cal) {
 #define COLOR_ORDER   GRB
 #define BRIGHTNESS    255  // Full brightness (brake light needs max)
 
-// LED Strip: 120 LEDs/m, 3cm cut sections (3 LEDs per section)
-// 2 segments × 9 sections × 3 LEDs = 54 LEDs total
+// LED Strip: 2 sections × 9 LEDs = 18 LEDs total
 // Physical wiring order: [BRAKE LIGHT] → [RAINBOW]
 
-constexpr uint8_t NUM_LEDS = 54;
+constexpr uint8_t NUM_LEDS = 18;
 
 // Section definitions (indices are inclusive)
-// Section 1: Brake light (9 sections × 3 LEDs = 27 LEDs)
-// Section 2: Rainbow (9 sections × 3 LEDs = 27 LEDs)
+// Data flow: Arduino → Brake → Rainbow
+// Section 1: Brake light (9 LEDs)
+// Section 2: Rainbow (9 LEDs)
 
 constexpr uint8_t SECTION_BRAKE_START  = 0;
-constexpr uint8_t SECTION_BRAKE_END    = 26;   // 27 LEDs - BRAKE LIGHT
+constexpr uint8_t SECTION_BRAKE_END    = 8;    // 9 LEDs - BRAKE LIGHT
 constexpr uint8_t SECTION_BRAKE_COUNT  = SECTION_BRAKE_END - SECTION_BRAKE_START + 1;
 
-constexpr uint8_t SECTION_RAINBOW_START = 27;
-constexpr uint8_t SECTION_RAINBOW_END   = 53;  // 27 LEDs - RAINBOW
+constexpr uint8_t SECTION_RAINBOW_START = 9;
+constexpr uint8_t SECTION_RAINBOW_END   = 17;  // 9 LEDs - RAINBOW
 constexpr uint8_t SECTION_RAINBOW_COUNT = SECTION_RAINBOW_END - SECTION_RAINBOW_START + 1;
 
 // ============== MPU6050 Configuration ==============
@@ -339,7 +339,7 @@ void setup() {
     FastLED.setBrightness(BRIGHTNESS);
     FastLED.clear();
     FastLED.show();
-
+ 
     Serial.println(F("\nSystem ready. Send 'c' to recalibrate.\n"));
     Serial.println(F("Pitch\tRoll\tLinX\tRate\tBrake"));
 }
@@ -825,7 +825,7 @@ static uint16_t rainbowHueOffset = 0;
 constexpr float RAINBOW_MIN_SPEED = 1.0f;    // Minimum hue change per update (when flat)
 constexpr float RAINBOW_MAX_SPEED = 10.0f;   // Maximum hue change per update (steep pitch)
 constexpr float RAINBOW_PITCH_SCALE = 0.30f; // How much pitch affects speed (per degree)
-constexpr uint8_t RAINBOW_HUE_DELTA = 9;     // Hue difference between adjacent LEDs (256/27 ≈ 9 for full rainbow)
+constexpr uint8_t RAINBOW_HUE_DELTA = 28;    // Hue difference between adjacent LEDs (256/9 ≈ 28 for full rainbow)
 
 // Helper: Update rainbow based on pitch
 void updateSideRainbow() {
