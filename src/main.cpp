@@ -333,9 +333,8 @@ void setup() {
         }
     }
 
-    // Initialize FastLED
-    FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS)
-           .setCorrection(TypicalLEDStrip);
+    // Initialize FastLED (no color correction for maximum brightness)
+    FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
     FastLED.setBrightness(BRIGHTNESS);
     FastLED.clear();
     FastLED.show();
@@ -836,7 +835,7 @@ void updateSideRainbow() {
 }
 
 // Rainbow section brightness
-constexpr uint8_t RAINBOW_BRIGHTNESS = 100;
+constexpr uint8_t RAINBOW_BRIGHTNESS = 255;  // Full brightness
 
 // Rainbow Section - 9 LEDs
 void showRainbowPattern() {
