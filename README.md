@@ -1,4 +1,4 @@
-# lidsled 🛷🌈
+# litsled 🛷🌈
 
 **An adaptive sled light system for people who don't brake.**
 
@@ -34,6 +34,6 @@ Some custom housings were designed and 3D printed to incorporate the microntroll
 
 ```bash
 brew install platformio
-cd lidsled
+cd litsled
 pio run --target upload
 ```

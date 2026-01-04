@@ -1,5 +1,5 @@
 /**
- * lidsled - Lit Sled Brake Light System
+ * litsled - Lit Sled Brake Light System
  * Arduino Nano + MPU6050 IMU + WS2812 LED Strip
  *
  * A sled brake light with pitch-reactive rainbow side lights.
