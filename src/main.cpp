@@ -196,16 +196,18 @@ constexpr float EMA_ALPHA = 0.15f;          // EMA smoothing factor (0.1=smooth,
 constexpr float MEDIAN_WINDOW = 5;           // Median filter window size (odd number)
 
 // Threshold with hysteresis (in m/s²)
-constexpr float BRAKE_THRESHOLD_ON  = -2.0f; // Trigger braking when accel drops below this
+constexpr float BRAKE_THRESHOLD_ON  = -1.0f; // Trigger braking when accel drops below this
 constexpr float BRAKE_THRESHOLD_OFF = -0.5f; // Release braking when accel rises above this
 
 // Timing requirements
-constexpr unsigned long BRAKE_MIN_DURATION_MS = 200;  // Minimum duration to confirm brake
-constexpr unsigned long BRAKE_DEBOUNCE_MS     = 50;   // Debounce time after release
+constexpr unsigned long BRAKE_MIN_DURATION_MS = 50;    // Minimum duration to confirm brake
+constexpr unsigned long BRAKE_DEBOUNCE_MS     = 50;    // Debounce time after release
+constexpr unsigned long BRAKE_HOLD_TIME_MS    = 1000;  // Minimum time brake light stays on
 
 // ============== Globals ==============
 CRGB leds[NUM_LEDS];
 MPU6050 mpu;
+bool imuAvailable = false;  // Track if IMU is connected and working
 
 #ifdef USE_MADGWICK_FILTER
 FastMadgwick filter;    // Custom Madgwick with adjustable beta
@@ -287,6 +289,7 @@ struct BrakeDetector {
 
     // Timing (state entry timestamps)
     unsigned long stateEntryTime = 0;
+    unsigned long brakeStartTime = 0;  // When braking was confirmed (for hold time)
 } brakeDetector;
 
 // ============== Function Declarations ==============
@@ -320,17 +323,12 @@ void setup() {
     Wire.begin();
     Wire.setClock(400000);  // 400kHz I2C clock
 
-    // Initialize MPU6050 with DMP
-    if (!initMPU6050()) {
-        Serial.println(F("MPU6050 initialization failed!"));
-        // Blink onboard LED to indicate error
-        pinMode(LED_BUILTIN, OUTPUT);
-        while (1) {
-            digitalWrite(LED_BUILTIN, HIGH);
-            delay(100);
-            digitalWrite(LED_BUILTIN, LOW);
-            delay(100);
-        }
+    // Initialize MPU6050 - continues without IMU if not connected
+    imuAvailable = initMPU6050();
+    if (!imuAvailable) {
+        Serial.println(F("WARNING: MPU6050 not detected! Running in LED-only mode."));
+        Serial.println(F("Connect IMU and reset, or continue without brake detection."));
+        // Don't hang - continue running for LED testing without IMU
     }
 
     // Initialize FastLED (no color correction for maximum brightness)
@@ -527,7 +525,7 @@ bool initMPU6050() {
 
 // ============== IMU Update ==============
 void updateIMU() {
-    if (!sensorReady) return;
+    if (!imuAvailable || !sensorReady) return;
 
     unsigned long now = micros();
     unsigned long elapsed = now - lastUpdate;
@@ -731,12 +729,14 @@ void updateBrakeDetection(float rawAccelX) {
             } else if (now - brakeDetector.stateEntryTime >= BRAKE_MIN_DURATION_MS) {
                 // Duration met → confirmed braking
                 brakeDetector.state = BrakeState::BRAKING;
+                brakeDetector.brakeStartTime = now;  // Record when braking started
             }
             break;
 
         case BrakeState::BRAKING:
             // Confirmed braking, waiting for release
-            if (aboveOffThreshold) {
+            // Only allow transition to RELEASING after minimum hold time
+            if (aboveOffThreshold && (now - brakeDetector.brakeStartTime >= BRAKE_HOLD_TIME_MS)) {
                 brakeDetector.state = BrakeState::RELEASING;
                 brakeDetector.stateEntryTime = now;
             }
@@ -786,7 +786,7 @@ void updateLEDs() {
     switch (brakeDetector.state) {
         case BrakeState::BRAKING:
         case BrakeState::RELEASING:  // Keep brake light on during release debounce
-        case BrakeState::PENDING:    // Show brake light as early warning
+        // case BrakeState::PENDING:    // Show brake light as early warning
             showBrakeLight();
             break;
 
@@ -807,7 +807,26 @@ void showBrakeLight() {
 
 // Brake section when NOT braking - dim tail light
 void showIdlePattern() {
-    fillSection(SECTION_BRAKE_START, SECTION_BRAKE_END, CRGB(15, 0, 0));
+    // Dual-layer effect: constant base + alternating blinking LEDs
+    const uint8_t BASE_BRIGHTNESS = 45;      // Always-on base brightness
+    const uint8_t BLINK_BRIGHTNESS = 75;     // Subtle blink
+    const uint16_t BLINK_PERIOD_MS = 700;    // Blink cycle (700ms = ~1.4Hz)
+    const uint16_t BLINK_ON_TIME_MS = 250;   // How long the blink stays bright
+    
+    // Determine if we're in the "on" phase of the blink
+    bool blinkOn = (millis() % BLINK_PERIOD_MS) < BLINK_ON_TIME_MS;
+    uint8_t blinkBrightness = blinkOn ? BLINK_BRIGHTNESS : BASE_BRIGHTNESS;
+    
+    // Apply to brake section: base on all, blink on alternating LEDs
+    for (uint8_t i = SECTION_BRAKE_START; i <= SECTION_BRAKE_END; i++) {
+        if ((i - SECTION_BRAKE_START) % 2 == 0) {
+            // Even LEDs: constant base brightness
+            leds[i] = CRGB(BASE_BRIGHTNESS, 0, 0);
+        } else {
+            // Odd LEDs: blinking brightness
+            leds[i] = CRGB(blinkBrightness, 0, 0);
+        }
+    }
 }
 
 // ============== Rainbow Section: Pitch-Controlled (9 LEDs) ==============
@@ -821,9 +840,9 @@ void showIdlePattern() {
 static uint16_t rainbowHueOffset = 0;
 
 // Configuration for rainbow effect (tuned for ski slopes: 5-40° typical)
-constexpr float RAINBOW_MIN_SPEED = 1.0f;    // Minimum hue change per update (when flat)
-constexpr float RAINBOW_MAX_SPEED = 10.0f;   // Maximum hue change per update (steep pitch)
-constexpr float RAINBOW_PITCH_SCALE = 0.30f; // How much pitch affects speed (per degree)
+constexpr float RAINBOW_MIN_SPEED = 3.0f;    // Minimum hue change per update (slow animation at 0°)
+constexpr float RAINBOW_MAX_SPEED = 15.0f;   // Maximum hue change per update (steep pitch)
+constexpr float RAINBOW_PITCH_SCALE = 0.60f; // How much pitch affects speed (max at 20°)
 constexpr uint8_t RAINBOW_HUE_DELTA = 28;    // Hue difference between adjacent LEDs (256/9 ≈ 28 for full rainbow)
 
 // Helper: Update rainbow based on pitch
@@ -849,6 +868,8 @@ void showRainbowPattern() {
 
 // ============== Debug Output ==============
 void printIMUData() {
+    if (!imuAvailable) return;  // Skip if IMU not connected
+    
     static unsigned long lastPrint = 0;
     static BrakeState lastState = BrakeState::IDLE;
     
