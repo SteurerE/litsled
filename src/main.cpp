@@ -786,7 +786,6 @@ void updateLEDs() {
     switch (brakeDetector.state) {
         case BrakeState::BRAKING:
         case BrakeState::RELEASING:  // Keep brake light on during release debounce
-        // case BrakeState::PENDING:    // Show brake light as early warning
             showBrakeLight();
             break;
 
