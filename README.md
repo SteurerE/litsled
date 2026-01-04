@@ -4,8 +4,6 @@
 
 *Wer bremst, verliert.* — Hermann Maier
 
-Congratulations on being a *responsible* sled pilot. You've decided that visibility and style matters. That the people behind you deserve a warning before you inevitably don't slow down anyway.
-
 ## Background
 
 This project evolved out of my shared passion for night sledging, often together with my brother and friends. We both enjoy the thrill of speeding downhill—sometimes at questionable speeds—on occasionally icy slopes, preferably in the dark. To improve visibility (and style), it became clear to us that upgrading our sleds with an adaptive light system, including a brake detection mechanism, was absolutely necessary. That’s why we created this project during the winter holidays of 2025/26. The system has been proven in real-world conditions, with the first test run taking place on January 3rd, 2026, near the Klagenfurter Hütte in Carinthia, Austria.
